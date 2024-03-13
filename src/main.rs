@@ -74,9 +74,30 @@ fn trip_updates_for(entities: &Vec<FeedEntity>, stations: Vec<String>) -> Result
     Ok(trips)
 }
 
+async fn update_alerts_feeds(db: Arc<Mutex<Feeds>>) -> Result<(), anyhow::Error> {
+    loop {
+        match update_alerts_feeds_inner(
+            &"https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/camsys%2Fsubway-alerts.json"
+                .to_string(),
+        )
+        .await
+        {
+            Ok(msg) => {
+                db.lock().unwrap().alerts = Some(msg);
+            }
+            Err(e) => {
+                println!("Errored! {}", e)
+            }
+        }
+        sleep(Duration::from_secs(15)).await;
+    }
+
+    Ok(())
+}
+
 async fn update_gtfs_feeds(db: Arc<Mutex<Feeds>>, endpoint: String) -> Result<(), anyhow::Error> {
     loop {
-        match update_gtfs_feeds_inner(&db, &endpoint).await {
+        match update_gtfs_feeds_inner(&endpoint).await {
             Ok(msg) => {
                 db.lock().unwrap().feeds.insert(endpoint.clone(), Some(msg));
             }
@@ -90,10 +111,7 @@ async fn update_gtfs_feeds(db: Arc<Mutex<Feeds>>, endpoint: String) -> Result<()
     Ok(())
 }
 
-async fn update_gtfs_feeds_inner(
-    db: &Arc<Mutex<Feeds>>,
-    endpoint: &String,
-) -> Result<FeedMessage, anyhow::Error> {
+async fn update_gtfs_feeds_inner(endpoint: &String) -> Result<FeedMessage, anyhow::Error> {
     let gtfs_client = Client::new();
     let gtfs_feed = gtfs_client
         .get(endpoint)
@@ -105,60 +123,79 @@ async fn update_gtfs_feeds_inner(
     Ok(feed_msg)
 }
 
+async fn update_alerts_feeds_inner(endpoint: &String) -> Result<String, anyhow::Error> {
+    let alerts_client = Client::new();
+    let alerts_json = alerts_client
+        .get(endpoint)
+        .header("x-api-key", api_key())
+        .send()
+        .await?;
+    let text = alerts_json.text().await?;
+    Ok(text)
+}
+
 #[derive(Default)]
 struct Feeds {
     feeds: HashMap<String, Option<FeedMessage>>,
+    alerts: Option<String>,
 }
 
 impl Feeds {
-    pub fn new(feeds: HashMap<String, Option<FeedMessage>>) -> Self {
-        Self { feeds }
+    pub fn new(feeds: HashMap<String, Option<FeedMessage>>, alerts: Option<String>) -> Self {
+        Self { feeds, alerts }
     }
 }
 
 #[tokio::main]
 async fn main() {
     // initialize shared state
-    let db = Arc::new(Mutex::new(Feeds::new(HashMap::from([
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs".to_string(),
-            None,
-        ),
-        (
-            "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si".to_string(),
-            None,
-        ),
-    ]))));
+    let gtfs_db = Arc::new(Mutex::new(Feeds::new(
+        HashMap::from([
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g".to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace"
+                    .to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm"
+                    .to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz".to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw"
+                    .to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l".to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs".to_string(),
+                None,
+            ),
+            (
+                "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si".to_string(),
+                None,
+            ),
+        ]),
+        None,
+    )));
 
     // build our application with a route
     let app = Router::new()
         .route("/api/v1/vehicles/", get(get_vehicle_positions))
         .route("/api/v1/trains_for_station/", get(get_trains_for_station))
-        .with_state(db.clone());
+        .route("/api/v1/alerts/", get(get_alerts))
+        .with_state(gtfs_db.clone());
 
     // run it
     let listener = tokio::net::TcpListener::bind("127.0.0.1:4567")
@@ -167,37 +204,39 @@ async fn main() {
     println!("listening on {}", listener.local_addr().unwrap());
 
     let update_gtfs_feeds_task_g = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g".to_string(),
     ));
     let update_gtfs_feeds_task_ace = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace".to_string(),
     ));
     let update_gtfs_feeds_task_bdfm = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm".to_string(),
     ));
     let update_gtfs_feeds_task_jz = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz".to_string(),
     ));
     let update_gtfs_feeds_task_nqrw = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw".to_string(),
     ));
     let update_gtfs_feeds_task_l = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l".to_string(),
     ));
     let update_gtfs_feeds_task_1234567 = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs".to_string(),
     ));
     let update_gtfs_feeds_task_sir = tokio::task::spawn(update_gtfs_feeds(
-        db.clone(),
+        gtfs_db.clone(),
         "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si".to_string(),
     ));
+
+    let update_alerts_feeds = tokio::task::spawn(update_alerts_feeds(gtfs_db.clone()));
     let web_task = tokio::task::spawn(axum::serve(listener, app).into_future());
 
     // TODO: how will i handle errors?
@@ -210,6 +249,7 @@ async fn main() {
         update_gtfs_feeds_task_l,
         update_gtfs_feeds_task_1234567,
         update_gtfs_feeds_task_sir,
+        update_alerts_feeds,
         web_task
     );
 }
@@ -217,6 +257,21 @@ async fn main() {
 #[derive(Default, Deserialize)]
 struct StationsQuery {
     stations: String,
+}
+
+#[derive(Default, Deserialize)]
+struct VehiclesQuery {
+    filter: String,
+}
+
+async fn get_alerts(State(state): State<Arc<Mutex<Feeds>>>) -> Result<String, AppError> {
+    let state = state.lock().unwrap();
+
+    if let Some(alerts) = &state.alerts {
+        return Ok(alerts.clone());
+    }
+
+    Ok("".to_string())
 }
 
 async fn get_trains_for_station(
@@ -243,11 +298,13 @@ async fn get_trains_for_station(
     Ok(Json(arrivals?))
 }
 
-#[debug_handler]
 async fn get_vehicle_positions(
+    query: Option<Query<VehiclesQuery>>,
     State(state): State<Arc<Mutex<Feeds>>>,
 ) -> Result<Json<Vec<VehiclePosition>>, AppError> {
     let state = state.lock().unwrap();
+
+    let Query(query) = query.unwrap_or_default();
 
     let feeds = state.feeds.values();
 
@@ -259,6 +316,19 @@ async fn get_vehicle_positions(
         }
     }
 
+    if !query.filter.is_empty() {
+        entity = entity
+            .clone()
+            .into_iter()
+            .filter(|e| {
+                if let Some(v) = &e.vehicle {
+                    v.clone().trip.unwrap().trip_id.unwrap() == query.filter
+                } else {
+                    false
+                }
+            })
+            .collect();
+    }
     Ok(Json(vehicle_pos_for(&entity)?))
 }
 
